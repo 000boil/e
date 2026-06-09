@@ -23,15 +23,15 @@ MARK = b"\xff\xfe\xfd"
 ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 SSH_OPTS = [
+    "-tt", "-p", "443",
     "-F", "/dev/null",
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
     "-o", "ServerAliveInterval=30",
-    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=15",
     "-o", "IdentitiesOnly=yes",
     "-o", "IdentityFile=/dev/null",
-    "-o", "PubkeyAuthentication=no",
 ]
 
 
@@ -92,42 +92,65 @@ def ntfy_wait(code, timeout=120):
     raise SystemExit("timed out — is main.py still running at home?")
 
 
-def parse_tunnel_output(text):
-    for pat in [
-        r"([a-z0-9.-]+\.lhr\.life)[:\s]+(\d+)",
-        r"([a-z0-9.-]+\.localhost\.run)[:\s]+(\d+)",
-        r"connect to[:\s]+([a-z0-9.-]+)[:\s]+(\d+)",
-    ]:
-        m = re.search(pat, text, re.I)
-        if m:
-            return m.group(1), int(m.group(2))
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", text)
+
+
+def parse_pinggy(text):
+    clean = strip_ansi(text)
+    m = re.search(r"tcp://([^:/\s]+):(\d+)", clean)
+    if m:
+        return m.group(1), int(m.group(2))
+    port_m = re.search(r"Allocated port (\d+) for remote forward", clean)
+    host_m = re.search(r"https://([a-z0-9-]+\.run\.pinggy-free\.link)", clean, re.I)
+    if port_m and host_m:
+        return host_m.group(1), int(port_m.group(1))
     return None, None
+
+
+def drain(fd):
+    while True:
+        try:
+            r, _, _ = select.select([fd], [], [], 2)
+            if fd not in r:
+                continue
+            if not os.read(fd, 4096):
+                break
+        except OSError:
+            break
 
 
 def open_tunnel():
     env = os.environ.copy()
     env.pop("SSH_AUTH_SOCK", None)
+    env["TERM"] = "dumb"
 
+    master, slave = pty.openpty()
     proc = subprocess.Popen(
-        ["ssh", *SSH_OPTS, "-R", f"0:localhost:{SHELL_PORT}", "nokey@localhost.run"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        ["ssh", *SSH_OPTS, "-R", f"0:127.0.0.1:{SHELL_PORT}", "tcp@a.pinggy.io"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
         env=env,
     )
+    os.close(slave)
 
-    buf = []
-    end = time.time() + 30
+    buf = b""
+    end = time.time() + 20
+    tick = 0
     while time.time() < end and proc.poll() is None:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            buf.append(line)
-            host, port = parse_tunnel_output("".join(buf))
-            if host:
-                return host, port, proc
-        elif not line and proc.poll() is not None:
-            break
+        r, _, _ = select.select([master], [], [], 0.4)
+        if master in r:
+            buf += os.read(master, 4096)
+        host, port = parse_pinggy(buf.decode(errors="replace"))
+        if host:
+            print("\r  tunnel ok          ")
+            threading.Thread(target=drain, args=(master,), daemon=True).start()
+            return host, port, proc
+        tick += 1
+        print(f"\r  opening tunnel ({tick}s)", end="", flush=True)
 
+    print("\r  tunnel failed      ")
     proc.kill()
     return None, None, None
 
